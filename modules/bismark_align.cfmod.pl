@@ -28,18 +28,16 @@ use CF::Helpers;
 
 # Module requirements
 my %requirements = (
-	'cores' 	=> ['4', '6'],
-	'memory' 	=> ['22G', '25G'], # upped this to 22 because non-directional alignments to GRCh38 may fail with 18
+	'cores' 	=> ['4', '64'],
+	'memory' 	=> ['13G', '160G'],
 	'modules' 	=> ['bowtie','bowtie2','bismark','samtools'],
-	'references'=> 'bismark',
 	'time' 		=> sub {
 		my $cf = $_[0];
 		my $num_files = $cf->{'num_starting_merged_aligned_files'};
 		$num_files = ($num_files > 0) ? $num_files : 1;
 		# Bismark alignment typically takes around than 3 hours per BAM file
 		# May need tweaking. Could also drop the estimate if we're multi-threading?
-		# Update: Keeps timing out. Bumping to 48 hours per file.
-		return CF::Helpers::minutes_to_timestamp ($num_files * 48 * 60);
+		return CF::Helpers::minutes_to_timestamp ($num_files * 5 * 60);
 	}
 );
 
@@ -48,12 +46,12 @@ my $helptext = "".("-"x22)."\n Bismark Align Module\n".("-"x22)."\n
 The bismark_align module runs the main bismark script.
 Bismark is a program to map bisulfite treated sequencing reads
 to a genome of interest and perform methylation calls.\n
-PBAT, single cell and Bowtie 1 mode can be specified in
-pipelines with the pbat, single_cell bt1 parameters. For example:
-  #bismark_align	pbat\n
-  #bismark_align	bt1\n
-  #bismark_align	single_cell\n
-  #bismark_align	unmapped\n
+PBAT, single cell and Bowtie 1/2 modes can be specified in
+pipelines with the pbat, single_cell bt1 and bt2 parameters. For example:
+#bismark_align	pbat2
+#bismark_align	bt1\n
+#bismark_align	bt2\n
+#bismark_align	single_cell\n
 Use bismark --help for further information.\n\n";
 
 # Setup
@@ -80,17 +78,40 @@ open (RUN,'>>',$cf{'run_fn'}) or die "###CF Error: Can't write to $cf{run_fn}: $
 warn "---------- Bismark version information ----------\n";
 warn `bismark --version`;
 warn "\n------- End of Bismark version information ------\n";
+
+# Work out how to parallelise bismark
 warn "Allocated $cf{cores} cores and $cf{memory} memory.\n";
+my $multi_cores = $cf{'cores'} / 8;
+my $multi_mem = CF::Helpers::human_readable_to_bytes($cf{'memory'})/ CF::Helpers::human_readable_to_bytes('20G');
+my $multi;
+$multi = int($multi_cores) if ($multi_cores > $multi_mem); # Really Perl, no min()?
+$multi = int($multi_mem) if ($multi_mem > $multi_cores);
+my $multicore;
+if($multi > 1){
+	$multicore = "--multicore $multi";
+	warn "Multi-threading alignment with $multicore\n";
+} else {
+	warn "Running in regular non multi-threaded mode.\n";
+}
+
 
 # Read options from the pipeline parameters
+my $bt1 = defined($cf{'params'}{'bt1'}) ? 1 : 0;
+my $bt2 = defined($cf{'params'}{'bt2'}) ? "--bowtie2" : '';
 my $pbat = defined($cf{'params'}{'pbat'}) ? "--pbat" : '';
-my $unmapped = defined($cf{'params'}{'unmapped'}) ? "--unmapped" : '';
-my $bowtie = defined($cf{'params'}{'bt1'}) ? "--bowtie1" : "--bowtie2";
 my $non_directional = defined($cf{'params'}{'single_cell'}) ? "--non_directional" : '';
-my $subsample = defined($cf{'params'}{'subsample'}) ? "-u 1000000" : '';
 
-if(defined($cf{'params'}{'subsample'})){
-	warn "WARNING! Bismark running in subsample mode - only first 1000000 reads will be aligned.\n";
+# Work out whether we should use bowtie 1 or 2 by read length
+if(!$bt1 && !$bt2){
+	if(!CF::Helpers::fastq_min_length($cf{'prev_job_files'}[0], 75)){
+		warn "First file has reads < 75bp long. Using bowtie 1 for aligning with bismark.\n";
+		$bt1 = 1;
+		$bt2 = "";
+	} else {
+		warn "First file has reads >= 75bp long. Using bowtie 2 for aligning with bismark.\n";
+		$bt1 = 0;
+		$bt2 = "--bowtie2";
+	}
 }
 
 # FastQ encoding type. Once found on one file will assume all others are the same
@@ -115,21 +136,18 @@ if($se_files && scalar(@$se_files) > 0){
 		if($encoding eq 'phred33' || $encoding eq 'phred64' || $encoding eq 'solexa'){
 			$enc = '--'.$encoding.'-quals';
 		}
-		
-		my $output_fn = $file;
-		$output_fn =~ s/(\.fastq\.gz|\.fq\.gz|\.fastq|\.fq)$//; # attempting to remove fastq.gz etc to make filename a little shorter 05 02 2016. Felix
-		$output_fn .= "_".$cf{config}{genome};
-		my $basename = $output_fn;
-		if($bowtie eq '--bowtie2'){
-		    $output_fn .= "_bismark_bt2.bam";
-		    $basename .= "_bismark_bt2";
+
+		my $output_fn;
+		my $basename; ## Ana
+		if($bt2){
+			$output_fn = $file."_bismark_bt2.bam";
+			$basename = $file."_bismark_bt2"; ## Ana
 		} else {
-		    $output_fn .= "_bismark.bam";
-		    $basename .= "_bismark";
+			$output_fn = $file."_bismark.bam";
+			$basename = $file."_bismark"; ## Ana
 		}
-		
-		my $command = "bismark --bam --basename $basename $bowtie $pbat $unmapped $non_directional $enc $cf{refs}{bismark} $file";
-		
+
+		my $command = "bismark $multicore --basename $basename --bam $bt2 $pbat $non_directional $enc $cf{refs}{bismark} $file"; ## Ana
 		warn "\n###CFCMD $command\n\n";
 
 		if(!system ($command)){
@@ -163,21 +181,18 @@ if($pe_files && scalar(@$pe_files) > 0){
 			if($encoding eq 'phred33' || $encoding eq 'phred64' || $encoding eq 'solexa'){
 				$enc = '--'.$encoding.'-quals';
 			}
-			
-			my $output_fn = $files[0];
-			$output_fn =~ s/(\.fastq\.gz|\.fq\.gz|\.fastq|\.fq)$//; # attempting to remove fastq.gz etc to make filename a little shorter 05 02 2016. Felix
-			$output_fn .= "_".$cf{config}{genome};
-			my $basename = $output_fn;
 
-			if($bowtie eq '--bowtie2'){
-			    $output_fn .= "_bismark_bt2_pe.bam";
-			    $basename .= "_bismark_bt2";
+			my $output_fn;
+			my $basename; ## Ana
+			if(length($bt2) > 0){
+				$output_fn = $files[0]."_bismark_bt2_pe.bam";
+				$basename = $files[0]."_bismark_bt2"; ## Ana
 			} else {
-			    $output_fn .= "_bismark_pe.bam";
-			    $basename .= "_bismark";
+				$output_fn = $files[0]."_bismark_pe.bam";
+				$basename = $files[0]."_bismark"; ## Ana
 			}
 
-			my $command = "bismark --bam --basename $basename $bowtie $pbat $unmapped $non_directional $enc $cf{refs}{bismark} -1 ".$files[0]." -2 ".$files[1];
+			my $command = "bismark $multicore --basename $basename --bam $bt2 $pbat $non_directional $enc $cf{refs}{bismark} -1 ".$files[0]." -2 ".$files[1]; ## Ana
 			warn "\n###CFCMD $command\n\n";
 
 			if(!system ($command)){
